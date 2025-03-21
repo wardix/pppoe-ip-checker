@@ -15,4 +15,9 @@ export const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || ''
 export const MYSQL_DATABASE = process.env.MYSQL_DATABASE || 'test'
 
 export const METRICS_FILE = process.env.METRICS_FILE || './data/metrics.txt'
-export const TEMP_METRICS_FILE = process.env.TEMP_METRICS_FILE || './data/metrics.txt.tmp'
+export const TEMP_METRICS_FILE =
+  process.env.TEMP_METRICS_FILE || './data/metrics.txt.tmp'
+export const MAX_CONSECUTIVE_ERRORS = Number(
+  process.env.MAX_CONSECUTIVE_ERRORS || 8,
+)
+export const MAX_BATCH_SIZE = Number(process.env.MAX_BATCH_SIZE || 128)

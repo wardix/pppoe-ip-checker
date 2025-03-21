@@ -15,6 +15,8 @@ import {
   MYSQL_DATABASE,
   TEMP_METRICS_FILE,
   METRICS_FILE,
+  MAX_CONSECUTIVE_ERRORS,
+  MAX_BATCH_SIZE,
 } from './config'
 import logger from './logger'
 
@@ -22,6 +24,12 @@ import logger from './logger'
 interface CustomerNetworkRecord {
   net: string
   csid: string
+}
+
+// Define interface for network host mapping
+interface NetworkHost {
+  host: string
+  iface: string
 }
 
 // Create MySQL connection pool
@@ -49,42 +57,31 @@ async function flushMetricsToFile(): Promise<void> {
     return
   }
 
+  const metricsToWrite = [...metricsBuffer] // Create a copy
+  metricsBuffer = [] // Clear the buffer immediately
+
   try {
+    // Ensure directory exists
+    const dir = path.dirname(TEMP_METRICS_FILE)
+    await fs.mkdir(dir, { recursive: true })
+
     // Write all metrics to temporary file
-    await fs.writeFile(TEMP_METRICS_FILE, metricsBuffer.join('\n') + '\n')
+    await fs.writeFile(TEMP_METRICS_FILE, metricsToWrite.join('\n') + '\n')
 
     // Rename temporary file to final destination (atomic operation)
     await fs.rename(TEMP_METRICS_FILE, METRICS_FILE)
 
-    logger.info(`Wrote ${metricsBuffer.length} metrics to ${METRICS_FILE}`)
-
-    // Clear the buffer after successful write
-    metricsBuffer = []
+    logger.info(`Wrote ${metricsToWrite.length} metrics to ${METRICS_FILE}`)
   } catch (err) {
     logger.error('Error writing metrics to file:', err)
-  }
-}
-
-// Function to clear the metrics file
-async function clearMetricsFile(): Promise<void> {
-  try {
-    // Create an empty file at the temporary location
-    await fs.writeFile(TEMP_METRICS_FILE, '')
-
-    // Rename to the target file (atomic replacement)
-    await fs.rename(TEMP_METRICS_FILE, METRICS_FILE)
-
-    logger.info(`Cleared metrics file: ${METRICS_FILE}`)
-  } catch (err) {
-    logger.error('Error clearing metrics file:', err)
+    // Put the metrics back in the buffer to try again later
+    metricsBuffer = [...metricsToWrite, ...metricsBuffer]
   }
 }
 
 async function main() {
   try {
     logger.info('Starting NATS message consumer')
-    // Clear the metrics file before starting
-    await clearMetricsFile()
     await consumeMessages()
   } catch (err) {
     logger.error('Fatal error:', err)
@@ -122,7 +119,6 @@ async function consumeMessages() {
 
   let backoffDelay = INITIAL_BACKOFF_DELAY
   let consecutiveErrors = 0
-  const MAX_CONSECUTIVE_ERRORS = 5
 
   while (true) {
     try {
@@ -146,6 +142,12 @@ async function consumeMessages() {
             logger.error(
               `Reached ${MAX_CONSECUTIVE_ERRORS} consecutive errors, exiting...`,
             )
+            // Flush any remaining metrics
+            if (metricsBuffer.length > 0) {
+              await flushMetricsToFile().catch((e) =>
+                logger.error('Error flushing metrics during shutdown:', e),
+              )
+            }
             await nc.drain()
             await pool.end()
             process.exit(1)
@@ -166,21 +168,19 @@ async function consumeMessages() {
   }
 }
 
-async function processMessage(message: JsMsg) {
+async function processMessage(message: JsMsg): Promise<void> {
   // Parse the message data
   const data = JSON.parse(new TextDecoder().decode(message.data))
   logger.info(`Processing message: ${message.seq}`)
 
   const networks: string[] = []
-  const placeHolders: string[] = []
-  const networkHosts = new Map<string, { host: string; iface: string }>()
+  const networkHosts = new Map<string, NetworkHost>()
 
   // Extract networks from the message
   for (const host in data.servers) {
     for (const { network, iface } of data.servers[host]) {
       networkHosts.set(network, { host, iface })
       networks.push(`${network}/32`)
-      placeHolders.push('?')
     }
   }
 
@@ -189,28 +189,14 @@ async function processMessage(message: JsMsg) {
     return
   }
 
-  let connection
   try {
-    // Connect to MySQL and execute a query
-    connection = await pool.getConnection()
+    // Process networks in batches to avoid query parameter limits
+    const results = await queryNetworksInBatches(networks)
 
-    const query = `
-      SELECT cst.Network net, cst.CustServId csid
-      FROM CustomerServiceTechnical cst
-      LEFT JOIN CustomerServices cs ON cs.CustServId = cst.CustServId
-      LEFT JOIN Customer c ON c.CustId = cs.CustId
-      WHERE c.BranchId = '020'
-      AND NOT (cs.ServiceId IN ('IPP'))
-      AND cst.Network IN (${placeHolders.join(',')})
-      ORDER BY cst.Network
-    `
+    // Process query results
+    const foundNetworks = new Set(results.map((row) => row.net))
 
-    // Execute the query with the network values
-    const [rows] = await connection.execute(query, networks)
-    const typedRows = rows as CustomerNetworkRecord[]
-
-    // Find networks that don't exist in the query results
-    const foundNetworks = new Set(typedRows.map((row) => row.net))
+    // Find missing networks
     const missingNetworks = networks.filter(
       (network) => !foundNetworks.has(network),
     )
@@ -218,20 +204,21 @@ async function processMessage(message: JsMsg) {
     // Collect unknown PPPoE addresses metrics
     for (const e of missingNetworks) {
       const net = e.replace('/32', '')
-      const { host, iface } = networkHosts.get(net) as {
-        host: string
-        iface: string
+      const networkHost = networkHosts.get(net)
+
+      if (networkHost) {
+        const { host, iface } = networkHost
+        const cleanIface = iface.replace('<pppoe-', '').replace('>', '')
+        const metric = `unknown_pppoe_address{net="${net}",host="${host}",iface="${cleanIface}"} 1`
+        addMetric(metric)
       }
-      const cleanIface = iface.replace('<pppoe-', '').replace('>', '')
-      const metric = `unknown_pppoe_address{net="${net}",host="${host}",iface="${cleanIface}"} 1`
-      addMetric(metric)
     }
 
     // Track duplicate networks
     const networkCounts = new Map<string, number>()
     const duplicateNetworks = new Set<string>()
 
-    for (const { net } of typedRows) {
+    for (const { net } of results) {
       networkCounts.set(net, (networkCounts.get(net) || 0) + 1)
       if (networkCounts.get(net)! > 1) {
         duplicateNetworks.add(net)
@@ -248,20 +235,56 @@ async function processMessage(message: JsMsg) {
       }
     }
 
-    // Flush collected metrics to file
+    // Ensure metrics are flushed to disk
     await flushMetricsToFile()
-
-    return {
-      processedNetworks: networks.length,
-      foundRecords: typedRows.length,
-      missingNetworks: missingNetworks,
-      duplicateNetworks: Array.from(duplicateNetworks),
-    }
   } catch (error) {
     logger.error('Database error:', error)
     throw error // Rethrow to trigger error handling in the consumer
+  }
+}
+
+// Function to query networks in batches
+async function queryNetworksInBatches(
+  networks: string[],
+): Promise<CustomerNetworkRecord[]> {
+  const allResults: CustomerNetworkRecord[] = []
+
+  // Process in batches to avoid query parameter limits
+  for (let i = 0; i < networks.length; i += MAX_BATCH_SIZE) {
+    const batch = networks.slice(i, i + MAX_BATCH_SIZE)
+    const batchResults = await queryNetworkBatch(batch)
+    allResults.push(...batchResults)
+  }
+
+  return allResults
+}
+
+// Function to query a batch of networks
+async function queryNetworkBatch(
+  networks: string[],
+): Promise<CustomerNetworkRecord[]> {
+  if (networks.length === 0) return []
+
+  const placeHolders = networks.map(() => '?')
+  let connection
+
+  try {
+    connection = await pool.getConnection()
+
+    const query = `
+      SELECT cst.Network net, cst.CustServId csid
+      FROM CustomerServiceTechnical cst
+      LEFT JOIN CustomerServices cs ON cs.CustServId = cst.CustServId
+      LEFT JOIN Customer c ON c.CustId = cs.CustId
+      WHERE c.BranchId = '020'
+      AND NOT (cs.ServiceId IN ('IPP'))
+      AND cst.Network IN (${placeHolders.join(',')})
+      ORDER BY cst.Network
+    `
+
+    const [rows] = await connection.execute(query, networks)
+    return rows as CustomerNetworkRecord[]
   } finally {
-    // Always release the connection back to the pool
     if (connection) connection.release()
   }
 }
