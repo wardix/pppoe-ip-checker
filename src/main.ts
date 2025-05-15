@@ -53,10 +53,6 @@ function addMetric(metric: string): void {
 
 // Function to flush metrics to file
 async function flushMetricsToFile(): Promise<void> {
-  if (metricsBuffer.length === 0) {
-    return
-  }
-
   const metricsToWrite = [...metricsBuffer] // Create a copy
   metricsBuffer = [] // Clear the buffer immediately
 
